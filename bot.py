@@ -66,10 +66,15 @@ async def admin(
 
 
 def day_keyboard(week_start: date) -> InlineKeyboardMarkup:
+    today = datetime.now(GYM_TIMEZONE).date()
     keyboard = []
 
     for offset in range(7):
         day_date = week_start + timedelta(days=offset)
+
+        if day_date < today:
+            continue
+
         keyboard.append(
             [
                 InlineKeyboardButton(
@@ -78,6 +83,16 @@ def day_keyboard(week_start: date) -> InlineKeyboardMarkup:
                 )
             ]
         )
+
+    # Allows recovery when an old week's buttons are clicked.
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "Choose another week",
+                callback_data="admin:create_week",
+            )
+        ]
+    )
 
     return InlineKeyboardMarkup(keyboard)
 
@@ -132,6 +147,14 @@ async def admin_buttons(
             action.removeprefix("admin:week:")
         )
         week_end = week_start + timedelta(days=6)
+        today = datetime.now(GYM_TIMEZONE).date()
+
+        if week_end < today:
+            await query.edit_message_text(
+                "That week has already passed. Choose another week.",
+                reply_markup=day_keyboard(week_start),
+            )
+            return
 
         context.user_data["week_draft"] = {
             "start_date": week_start.isoformat(),
@@ -171,7 +194,17 @@ async def admin_buttons(
         if not week_start <= selected_day < week_start + timedelta(days=7):
             await query.edit_message_text(
                 "This day belongs to another week. "
-                "Send /admin to choose your week again."
+                "Choose a day from your current week.",
+                reply_markup=day_keyboard(week_start),
+            )
+            return
+
+        today = datetime.now(GYM_TIMEZONE).date()
+
+        if selected_day < today:
+            await query.edit_message_text(
+                "That day has already passed. Choose an available day.",
+                reply_markup=day_keyboard(week_start),
             )
             return
 
