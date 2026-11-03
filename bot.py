@@ -1,3 +1,87 @@
+import os
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from dotenv import load_dotenv
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
+
+
+ADMIN_ID = 7265018265
+GYM_TIMEZONE = ZoneInfo("Asia/Tehran")
+
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if update.message is not None:
+        await update.message.reply_text(
+            "Welcome to the gym booking bot! 🏋️"
+        )
+
+
+async def my_id(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if update.message is not None and update.effective_user is not None:
+        await update.message.reply_text(
+            f"Your Telegram user ID is {update.effective_user.id}"
+        )
+
+
+async def admin(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if update.message is None or update.effective_user is None:
+        return
+
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text(
+            "You do not have access to the admin panel."
+        )
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "📅 Create week",
+                callback_data="admin:create_week",
+            )
+        ]
+    ]
+
+    await update.message.reply_text(
+        "Welcome to the gym admin panel! 🏋️",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+def day_keyboard(week_start: date) -> InlineKeyboardMarkup:
+    keyboard = []
+
+    for offset in range(7):
+        day_date = week_start + timedelta(days=offset)
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"{day_date:%A} · {day_date:%Y-%m-%d}",
+                    callback_data=f"admin:day:{day_date.isoformat()}",
+                )
+            ]
+        )
+
+    return InlineKeyboardMarkup(keyboard)
+
+
 async def admin_buttons(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -11,11 +95,12 @@ async def admin_buttons(
         return
 
     await query.answer()
+    action = query.data or ""
 
-    if query.data == "admin:create_week":
+    if action == "admin:create_week":
         today = datetime.now(GYM_TIMEZONE).date()
 
-        # Monday is 0 and Saturday is 5 in Python.
+        # Python counts Monday as 0 and Saturday as 5.
         days_since_saturday = (today.weekday() - 5) % 7
         this_saturday = today - timedelta(days=days_since_saturday)
         next_saturday = this_saturday + timedelta(days=7)
@@ -40,10 +125,11 @@ async def admin_buttons(
             "Dates are shown as year-month-day.",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
+        return
 
-    elif query.data and query.data.startswith("admin:week:"):
+    if action.startswith("admin:week:"):
         week_start = date.fromisoformat(
-            query.data.removeprefix("admin:week:")
+            action.removeprefix("admin:week:")
         )
         week_end = week_start + timedelta(days=6)
 
@@ -52,50 +138,35 @@ async def admin_buttons(
             "days": {},
         }
 
-        day_names = [
-            "Saturday",
-            "Sunday",
-            "Monday",
-            "Tuesday",
-            "Wednesday",
-            "Thursday",
-            "Friday",
-        ]
-
-        keyboard = []
-
-        for offset, day_name in enumerate(day_names):
-            day_date = week_start + timedelta(days=offset)
-
-            keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        f"{day_name} · {day_date:%Y-%m-%d}",
-                        callback_data=f"admin:day:{day_date.isoformat()}",
-                    )
-                ]
-            )
-
         await query.edit_message_text(
             f"Week of {week_start:%Y-%m-%d} "
             f"to {week_end:%Y-%m-%d}\n\n"
             "Choose a day to configure.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            reply_markup=day_keyboard(week_start),
         )
+        return
 
-    elif query.data and query.data.startswith("admin:day:"):
-        draft = context.user_data.get("week_draft")
+    draft = context.user_data.get("week_draft")
 
-        if draft is None:
-            await query.edit_message_text(
-                "Your draft has expired. Send /admin to choose a week again."
-            )
-            return
+    if draft is None:
+        await query.edit_message_text(
+            "Your draft has expired. Send /admin to choose a week again."
+        )
+        return
 
+    week_start = date.fromisoformat(draft["start_date"])
+
+    if action == "admin:days":
+        await query.edit_message_text(
+            "Choose a day to configure.",
+            reply_markup=day_keyboard(week_start),
+        )
+        return
+
+    if action.startswith("admin:day:"):
         selected_day = date.fromisoformat(
-            query.data.removeprefix("admin:day:")
+            action.removeprefix("admin:day:")
         )
-        week_start = date.fromisoformat(draft["start_date"])
 
         if not week_start <= selected_day < week_start + timedelta(days=7):
             await query.edit_message_text(
@@ -121,31 +192,27 @@ async def admin_buttons(
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
-    elif query.data == "admin:days":
-        draft = context.user_data.get("week_draft")
 
-        if draft is None:
-            await query.edit_message_text(
-                "Your draft has expired. Send /admin to choose a week again."
-            )
-            return
+def main() -> None:
+    env_path = Path(__file__).resolve().parent / ".env"
+    load_dotenv(env_path)
 
-        week_start = date.fromisoformat(draft["start_date"])
-        keyboard = []
+    token = os.getenv("BOT_TOKEN", "").strip()
+    if not token:
+        raise SystemExit("Add BOT_TOKEN to your .env file.")
 
-        for offset in range(7):
-            day_date = week_start + timedelta(days=offset)
+    application = Application.builder().token(token).build()
 
-            keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        f"{day_date:%A} · {day_date:%Y-%m-%d}",
-                        callback_data=f"admin:day:{day_date.isoformat()}",
-                    )
-                ]
-            )
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("myid", my_id))
+    application.add_handler(CommandHandler("admin", admin))
+    application.add_handler(
+        CallbackQueryHandler(admin_buttons, pattern=r"^admin:")
+    )
 
-        await query.edit_message_text(
-            "Choose a day to configure.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
+    print("Starting bot. Press Ctrl+C to stop.")
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    main()
