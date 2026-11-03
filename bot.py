@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -51,7 +51,12 @@ async def admin(
         return
 
     keyboard = [
-        [InlineKeyboardButton("📅 Create week", callback_data="admin:create_week")]
+        [
+            InlineKeyboardButton(
+                "📅 Create week",
+                callback_data="admin:create_week",
+            )
+        ]
     ]
 
     await update.message.reply_text(
@@ -77,7 +82,7 @@ async def admin_buttons(
     if query.data == "admin:create_week":
         today = datetime.now(GYM_TIMEZONE).date()
 
-        # Python numbers weekdays from Monday=0 to Sunday=6.
+        # Monday is 0 and Saturday is 5 in Python.
         days_since_saturday = (today.weekday() - 5) % 7
         this_saturday = today - timedelta(days=days_since_saturday)
         next_saturday = this_saturday + timedelta(days=7)
@@ -104,15 +109,20 @@ async def admin_buttons(
         )
 
     elif query.data and query.data.startswith("admin:week:"):
-        week_start = query.data.removeprefix("admin:week:")
+        week_start = date.fromisoformat(
+            query.data.removeprefix("admin:week:")
+        )
+        week_end = week_start + timedelta(days=6)
 
         context.user_data["week_draft"] = {
-            "start_date": week_start,
+            "start_date": week_start.isoformat(),
             "days": {},
         }
 
         await query.edit_message_text(
-            f"Selected week starting Saturday, {week_start}.\n\n"
+            f"Selected week\n"
+            f"Saturday {week_start:%Y-%m-%d} "
+            f"to Friday {week_end:%Y-%m-%d}\n\n"
             "Your week draft is ready for configuring its days."
         )
 
