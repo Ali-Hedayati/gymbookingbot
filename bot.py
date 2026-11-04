@@ -1,4 +1,6 @@
 import os
+import re
+from uuid import uuid4
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -10,37 +12,29 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 
 ADMIN_ID = 7265018265
 GYM_TIMEZONE = ZoneInfo("Asia/Tehran")
+DEFAULT_CAPACITIES = {"private": 2, "public": 6}
 
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is not None:
-        await update.message.reply_text(
-            "Welcome to the gym booking bot! 🏋️"
-        )
+        await update.message.reply_text("Welcome to the gym booking bot! 🏋️")
 
 
-async def my_id(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is not None and update.effective_user is not None:
         await update.message.reply_text(
             f"Your Telegram user ID is {update.effective_user.id}"
         )
 
 
-async def admin(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None or update.effective_user is None:
         return
 
@@ -50,18 +44,13 @@ async def admin(
         )
         return
 
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "📅 Create week",
-                callback_data="admin:create_week",
-            )
-        ]
-    ]
-
+    context.user_data.pop("awaiting_times", None)
+    context.user_data.pop("session_preview", None)
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📅 Create week", callback_data="admin:create_week")]]
+    )
     await update.message.reply_text(
-        "Welcome to the gym admin panel! 🏋️",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        "Welcome to the gym admin panel! 🏋️", reply_markup=keyboard
     )
 
 
@@ -71,35 +60,80 @@ def day_keyboard(week_start: date) -> InlineKeyboardMarkup:
 
     for offset in range(7):
         day_date = week_start + timedelta(days=offset)
-
         if day_date < today:
             continue
-
         keyboard.append(
-            [
-                InlineKeyboardButton(
-                    f"{day_date:%A} · {day_date:%Y-%m-%d}",
-                    callback_data=f"admin:day:{day_date.isoformat()}",
-                )
-            ]
+            [InlineKeyboardButton(
+                f"{day_date:%A} · {day_date:%Y-%m-%d}",
+                callback_data=f"admin:day:{day_date.isoformat()}",
+            )]
         )
 
-    # Allows recovery when an old week's buttons are clicked.
     keyboard.append(
-        [
-            InlineKeyboardButton(
-                "Choose another week",
-                callback_data="admin:create_week",
-            )
-        ]
+        [InlineKeyboardButton(
+            "Choose another week", callback_data="admin:create_week"
+        )]
     )
-
     return InlineKeyboardMarkup(keyboard)
 
 
+def type_keyboard(selected_day: date) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(
+                "🔒 Private · default 2 people",
+                callback_data=f"admin:type:{selected_day}:private",
+            )],
+            [InlineKeyboardButton(
+                "👥 Public · default 6 people",
+                callback_data=f"admin:type:{selected_day}:public",
+            )],
+            [InlineKeyboardButton(
+                "Choose another day", callback_data="admin:days"
+            )],
+        ]
+    )
+
+
+def capacity_keyboard(selected_day: date) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(
+                "Generate sessions",
+                callback_data=f"admin:generate:{selected_day}",
+            )],
+            [
+                InlineKeyboardButton(
+                    "− One person",
+                    callback_data=f"admin:capacity:{selected_day}:decrease",
+                ),
+                InlineKeyboardButton(
+                    "+ One person",
+                    callback_data=f"admin:capacity:{selected_day}:increase",
+                ),
+            ],
+            [InlineKeyboardButton(
+                "Change session type",
+                callback_data=f"admin:day:{selected_day}",
+            )],
+            [InlineKeyboardButton(
+                "Choose another day", callback_data="admin:days"
+            )],
+        ]
+    )
+
+
+def day_summary(selected_day: date, day_settings: dict) -> str:
+    return (
+        f"Day · {selected_day:%A, %Y-%m-%d}\n"
+        f"Session type · {day_settings['session_type'].title()}\n"
+        f"Capacity per session · {day_settings['capacity']} people\n\n"
+        "Adjust the capacity using the buttons below."
+    )
+
+
 async def admin_buttons(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     query = update.callback_query
     if query is None:
@@ -111,44 +145,75 @@ async def admin_buttons(
 
     await query.answer()
     action = query.data or ""
+    today = datetime.now(GYM_TIMEZONE).date()
+
+    if action.startswith("admin:confirm:") or action.startswith("admin:back:"):
+        preview = context.user_data.get("session_preview")
+        if preview is None or action.split(":")[-1] != preview["id"]:
+            await query.edit_message_text(
+                "This preview has expired. Send /admin to continue."
+            )
+            return
+
+        draft = context.user_data.get("week_draft")
+        if draft is None or draft["start_date"] != preview["week_start"]:
+            await query.edit_message_text("Your draft has expired. Send /admin again.")
+            return
+
+        selected_day = date.fromisoformat(preview["day"])
+        day_settings = draft["days"][preview["day"]]
+        if action.startswith("admin:confirm:"):
+            first_start = datetime.fromisoformat(preview["sessions"][0]["start"])
+            if first_start <= datetime.now(GYM_TIMEZONE):
+                context.user_data.pop("session_preview", None)
+                await query.edit_message_text(
+                    "The first session has already started. Generate new times.",
+                    reply_markup=capacity_keyboard(selected_day),
+                )
+                return
+            day_settings["sessions"] = preview["sessions"]
+            message = (
+                f"Added {len(preview['sessions'])} sessions to the week draft.\n"
+                "They remain in memory until the bot stops."
+            )
+        else:
+            message = "Returned to day settings. Preview discarded."
+
+        context.user_data.pop("session_preview", None)
+        await query.edit_message_text(
+            message, reply_markup=capacity_keyboard(selected_day)
+        )
+        return
+
+    context.user_data.pop("awaiting_times", None)
+    context.user_data.pop("session_preview", None)
 
     if action == "admin:create_week":
-        today = datetime.now(GYM_TIMEZONE).date()
-
-        # Python counts Monday as 0 and Saturday as 5.
         days_since_saturday = (today.weekday() - 5) % 7
         this_saturday = today - timedelta(days=days_since_saturday)
         next_saturday = this_saturday + timedelta(days=7)
-
-        keyboard = [
+        keyboard = InlineKeyboardMarkup(
             [
-                InlineKeyboardButton(
+                [InlineKeyboardButton(
                     f"This week · {this_saturday:%Y-%m-%d}",
-                    callback_data=f"admin:week:{this_saturday.isoformat()}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
+                    callback_data=f"admin:week:{this_saturday}",
+                )],
+                [InlineKeyboardButton(
                     f"Next week · {next_saturday:%Y-%m-%d}",
-                    callback_data=f"admin:week:{next_saturday.isoformat()}",
-                )
-            ],
-        ]
-
+                    callback_data=f"admin:week:{next_saturday}",
+                )],
+            ]
+        )
         await query.edit_message_text(
             "Choose the week you want to prepare.\n"
             "Dates are shown as year-month-day.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            reply_markup=keyboard,
         )
         return
 
     if action.startswith("admin:week:"):
-        week_start = date.fromisoformat(
-            action.removeprefix("admin:week:")
-        )
+        week_start = date.fromisoformat(action.removeprefix("admin:week:"))
         week_end = week_start + timedelta(days=6)
-        today = datetime.now(GYM_TIMEZONE).date()
-
         if week_end < today:
             await query.edit_message_text(
                 "That week has already passed. Choose another week.",
@@ -160,17 +225,14 @@ async def admin_buttons(
             "start_date": week_start.isoformat(),
             "days": {},
         }
-
         await query.edit_message_text(
-            f"Week of {week_start:%Y-%m-%d} "
-            f"to {week_end:%Y-%m-%d}\n\n"
+            f"Week of {week_start:%Y-%m-%d} to {week_end:%Y-%m-%d}\n\n"
             "Choose a day to configure.",
             reply_markup=day_keyboard(week_start),
         )
         return
 
     draft = context.user_data.get("week_draft")
-
     if draft is None:
         await query.edit_message_text(
             "Your draft has expired. Send /admin to choose a week again."
@@ -178,52 +240,213 @@ async def admin_buttons(
         return
 
     week_start = date.fromisoformat(draft["start_date"])
-
     if action == "admin:days":
         await query.edit_message_text(
-            "Choose a day to configure.",
+            "Choose a day to configure.", reply_markup=day_keyboard(week_start)
+        )
+        return
+
+    # Day-specific buttons carry their date to prevent edits to another day.
+    parts = action.split(":")
+    if len(parts) < 3 or parts[1] not in ("day", "type", "capacity", "generate"):
+        return
+
+    selected_day = date.fromisoformat(parts[2])
+    if not week_start <= selected_day < week_start + timedelta(days=7):
+        await query.edit_message_text(
+            "This day belongs to another week. Choose a day again.",
             reply_markup=day_keyboard(week_start),
         )
         return
 
-    if action.startswith("admin:day:"):
-        selected_day = date.fromisoformat(
-            action.removeprefix("admin:day:")
+    if selected_day < today:
+        await query.edit_message_text(
+            "That day has already passed. Choose an available day.",
+            reply_markup=day_keyboard(week_start),
         )
+        return
 
-        if not week_start <= selected_day < week_start + timedelta(days=7):
-            await query.edit_message_text(
-                "This day belongs to another week. "
-                "Choose a day from your current week.",
-                reply_markup=day_keyboard(week_start),
-            )
-            return
+    selected_date = selected_day.isoformat()
 
-        today = datetime.now(GYM_TIMEZONE).date()
-
-        if selected_day < today:
-            await query.edit_message_text(
-                "That day has already passed. Choose an available day.",
-                reply_markup=day_keyboard(week_start),
-            )
-            return
-
-        draft["selected_day"] = selected_day.isoformat()
-
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "Choose another day",
-                    callback_data="admin:days",
-                )
-            ]
-        ]
-
+    if parts[1] == "day":
+        draft["selected_day"] = selected_date
         await query.edit_message_text(
             f"Selected day · {selected_day:%A, %Y-%m-%d}\n\n"
-            "This is the day we will configure sessions for.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            "Choose the default session type for this day.",
+            reply_markup=type_keyboard(selected_day),
         )
+        return
+
+    if selected_date != draft.get("selected_day"):
+        await query.edit_message_text(
+            "This button belongs to another day. Choose a day again.",
+            reply_markup=day_keyboard(week_start),
+        )
+        return
+
+    if parts[1] == "generate":
+        if query.message is None or query.message.chat.type != "private":
+            await query.edit_message_text("Open the bot in a private chat to enter times.")
+            return
+        day_settings = draft["days"].get(selected_date)
+        if day_settings is None or "capacity" not in day_settings:
+            await query.edit_message_text(
+                "Choose the session type first.",
+                reply_markup=type_keyboard(selected_day),
+            )
+            return
+        context.user_data["awaiting_times"] = selected_date
+        await query.edit_message_text(
+            f"Generate sessions for {selected_day:%A, %Y-%m-%d}.\n\n"
+            "Send opening and closing times, using the 24-hour clock.\n"
+            "Example · 08:00 20:00\n"
+            "This uses the default duration of 2 hours.\n\n"
+            "Or add the number of equal sessions.\n"
+            "Example · 08:00 20:00 6\n\n"
+            "End time must be later on the same day.\n"
+            "Confirming will replace this day's draft time slots.\n"
+            "Send /admin to cancel.",
+        )
+        return
+
+    if len(parts) != 4:
+        return
+
+    if parts[1] == "type":
+        session_type = parts[3]
+        if session_type not in DEFAULT_CAPACITIES:
+            return
+
+        day_settings = draft["days"].setdefault(selected_date, {})
+        day_settings["session_type"] = session_type
+        day_settings["capacity"] = DEFAULT_CAPACITIES[session_type]
+
+    else:
+        day_settings = draft["days"].get(selected_date)
+        if day_settings is None or "capacity" not in day_settings:
+            await query.edit_message_text(
+                "Choose the session type first.",
+                reply_markup=type_keyboard(selected_day),
+            )
+            return
+
+        if parts[3] == "increase":
+            day_settings["capacity"] += 1
+        elif parts[3] == "decrease":
+            if day_settings["capacity"] == 1:
+                return
+            day_settings["capacity"] -= 1
+        else:
+            return
+
+    await query.edit_message_text(
+        day_summary(selected_day, day_settings),
+        reply_markup=capacity_keyboard(selected_day),
+    )
+
+
+
+def generate_sessions(text: str, selected_day: date, settings: dict) -> list[dict]:
+    fields = text.split()
+    if len(fields) not in (2, 3):
+        raise ValueError("Send two times and optionally a session count, such as 08:00 20:00 6.")
+
+    minutes = []
+    for value in fields[:2]:
+        if re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value) is None:
+            raise ValueError("Use times between 00:00 and 23:59, such as 08:00.")
+        hour, minute = map(int, value.split(":"))
+        minutes.append(hour * 60 + minute)
+
+    opening, closing = minutes
+    total_minutes = closing - opening
+    if total_minutes <= 0:
+        raise ValueError("Closing time must be later than opening time on the same day.")
+
+    if len(fields) == 3:
+        if not fields[2].isascii() or not fields[2].isdigit():
+            raise ValueError("Session count must be a positive whole number.")
+        count = int(fields[2])
+        if count < 1 or count > total_minutes:
+            raise ValueError("Each session must last at least one minute.")
+        if total_minutes % count:
+            raise ValueError("These hours cannot divide into that many equal sessions at minute precision. Choose another count or different times.")
+        duration = total_minutes // count
+    else:
+        duration = 120
+        if total_minutes % duration:
+            raise ValueError("These hours do not divide into 2-hour sessions. Add a session count or change the times.")
+        count = total_minutes // duration
+
+    midnight = datetime.combine(selected_day, datetime.min.time(), tzinfo=GYM_TIMEZONE)
+    first_start = midnight + timedelta(minutes=opening)
+    if first_start <= datetime.now(GYM_TIMEZONE):
+        raise ValueError("The opening time must be in the future.")
+
+    sessions = []
+    for index in range(count):
+        start = first_start + timedelta(minutes=index * duration)
+        end = start + timedelta(minutes=duration)
+        sessions.append({
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "session_type": settings["session_type"],
+            "capacity": settings["capacity"],
+        })
+    return sessions
+
+
+async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user is None or update.effective_user.id != ADMIN_ID:
+        return
+    if update.message is None or update.message.text is None:
+        return
+
+    selected_date = context.user_data.get("awaiting_times")
+    draft = context.user_data.get("week_draft")
+    if selected_date is None or draft is None:
+        return
+
+    settings = draft["days"].get(selected_date)
+    if settings is None:
+        return
+    selected_day = date.fromisoformat(selected_date)
+    try:
+        sessions = generate_sessions(update.message.text, selected_day, settings)
+    except ValueError as error:
+        await update.message.reply_text(str(error))
+        return
+
+    preview_id = uuid4().hex[:12]
+    context.user_data.pop("awaiting_times", None)
+    context.user_data["session_preview"] = {
+        "id": preview_id,
+        "week_start": draft["start_date"],
+        "day": selected_date,
+        "sessions": sessions,
+    }
+
+    lines = [f"Preview · {selected_day:%A, %Y-%m-%d}"]
+    lines.append(f"{settings['session_type'].title()} · capacity {settings['capacity']} per session")
+    lines.append(f"Total sessions · {len(sessions)}")
+    for index, session in enumerate(sessions, start=1):
+        start = datetime.fromisoformat(session["start"])
+        end = datetime.fromisoformat(session["end"])
+        lines.append(f"{index}. {start:%H:%M}–{end:%H:%M}")
+
+    # Split long previews so every message fits Telegram's text limit.
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 3500:
+            await update.message.reply_text(chunk)
+            chunk = ""
+        chunk += line + "\n"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Confirm day", callback_data=f"admin:confirm:{preview_id}")],
+        [InlineKeyboardButton("Back", callback_data=f"admin:back:{preview_id}")],
+    ])
+    await update.message.reply_text(chunk, reply_markup=keyboard)
 
 
 def main() -> None:
@@ -235,12 +458,15 @@ def main() -> None:
         raise SystemExit("Add BOT_TOKEN to your .env file.")
 
     application = Application.builder().token(token).build()
-
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("myid", my_id))
     application.add_handler(CommandHandler("admin", admin))
     application.add_handler(
         CallbackQueryHandler(admin_buttons, pattern=r"^admin:")
+    )
+
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, admin_text)
     )
 
     print("Starting bot. Press Ctrl+C to stop.")
