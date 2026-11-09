@@ -23,6 +23,12 @@ def database():
 def initialize_database() -> None:
     with database() as connection:
         connection.executescript("""
+            CREATE TABLE IF NOT EXISTS gym_settings (
+                admin_id INTEGER PRIMARY KEY,
+                private_capacity INTEGER NOT NULL DEFAULT 2 CHECK (private_capacity > 0),
+                public_capacity INTEGER NOT NULL DEFAULT 6 CHECK (public_capacity > 0),
+                duration_minutes INTEGER NOT NULL DEFAULT 120 CHECK (duration_minutes BETWEEN 1 AND 1439)
+            );
             CREATE TABLE IF NOT EXISTS weeks (
                 admin_id INTEGER NOT NULL,
                 week_start TEXT NOT NULL,
@@ -44,6 +50,28 @@ def initialize_database() -> None:
                     REFERENCES weeks (admin_id, week_start)
             );
         """)
+
+
+def get_settings(admin_id: int) -> dict:
+    with database() as connection:
+        row = connection.execute(
+            "SELECT private_capacity, public_capacity, duration_minutes FROM gym_settings WHERE admin_id = ?",
+            (admin_id,),
+        ).fetchone()
+    if row is None:
+        return {"private_capacity": 2, "public_capacity": 6, "duration_minutes": 120}
+    return dict(row)
+
+
+def update_setting(admin_id: int, field: str, value: int) -> None:
+    fields = {"private_capacity", "public_capacity", "duration_minutes"}
+    maximum = 1439 if field == "duration_minutes" else 2147483647
+    if field not in fields or not isinstance(value, int) or not 1 <= value <= maximum:
+        raise ValueError("The setting value is outside its allowed range.")
+    with database() as connection:
+        connection.execute("INSERT OR IGNORE INTO gym_settings (admin_id) VALUES (?)", (admin_id,))
+        # The column name is validated against the fixed field set above.
+        connection.execute(f"UPDATE gym_settings SET {field} = ? WHERE admin_id = ?", (value, admin_id))
 
 
 def load_week(admin_id: int, week_start: str) -> dict:

@@ -19,12 +19,24 @@ from telegram.ext import (
 )
 
 
-from storage import initialize_database, load_week, save_draft, publish_week, upcoming_sessions
+from storage import (
+    get_settings,
+    initialize_database,
+    load_week,
+    publish_week,
+    save_draft,
+    upcoming_sessions,
+    update_setting,
+)
 
 
 ADMIN_ID = 7265018265
 GYM_TIMEZONE = ZoneInfo("Asia/Tehran")
-DEFAULT_CAPACITIES = {"private": 2, "public": 6}
+SETTING_LABELS = {
+    "private_capacity": "Private session capacity",
+    "public_capacity": "Public session capacity",
+    "duration_minutes": "Default session duration in minutes",
+}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -51,8 +63,12 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     context.user_data.pop("awaiting_times", None)
     context.user_data.pop("session_preview", None)
+    context.user_data.pop("setting_edit", None)
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("📅 Create / open week", callback_data="admin:create_week")]]
+        [
+            [InlineKeyboardButton("📅 Create / open week", callback_data="admin:create_week")],
+            [InlineKeyboardButton("⚙️ Settings", callback_data="admin:settings")],
+        ]
     )
     await update.message.reply_text(
         "Welcome to the gym admin panel! 🏋️", reply_markup=keyboard
@@ -81,60 +97,36 @@ def day_keyboard(week_start: date) -> InlineKeyboardMarkup:
     )
     keyboard.append(
         [InlineKeyboardButton(
-            "Choose another week", callback_data="admin:create_week"
+            "Back · weeks", callback_data="admin:create_week"
         )]
     )
     return InlineKeyboardMarkup(keyboard)
 
 
 def type_keyboard(selected_day: date) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(
-                "🔒 Private · default 2 people",
-                callback_data=f"admin:type:{selected_day}:private",
-            )],
-            [InlineKeyboardButton(
-                "👥 Public · default 6 people",
-                callback_data=f"admin:type:{selected_day}:public",
-            )],
-            [InlineKeyboardButton(
-                "Choose another day", callback_data="admin:days"
-            )],
-        ]
-    )
+    defaults = get_settings(ADMIN_ID)
+    week_start = selected_day - timedelta(days=(selected_day.weekday() - 5) % 7)
+    saved = load_week(ADMIN_ID, str(week_start))
+    has_sessions = bool(saved["days"].get(str(selected_day), {}).get("sessions"))
+    back = f"admin:day:{selected_day}" if has_sessions else "admin:days"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"🔒 Private · {defaults['private_capacity']} people",
+            callback_data=f"admin:type:{selected_day}:private",
+        )],
+        [InlineKeyboardButton(
+            f"👥 Public · {defaults['public_capacity']} people",
+            callback_data=f"admin:type:{selected_day}:public",
+        )],
+        [InlineKeyboardButton("Back", callback_data=back)],
+    ])
 
 
-def capacity_keyboard(selected_day: date) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(
-                "View saved sessions",
-                callback_data=f"admin:view:{selected_day}",
-            )],
-            [InlineKeyboardButton(
-                "Generate sessions",
-                callback_data=f"admin:generate:{selected_day}",
-            )],
-            [
-                InlineKeyboardButton(
-                    "− One person",
-                    callback_data=f"admin:capacity:{selected_day}:decrease",
-                ),
-                InlineKeyboardButton(
-                    "+ One person",
-                    callback_data=f"admin:capacity:{selected_day}:increase",
-                ),
-            ],
-            [InlineKeyboardButton(
-                "Change session type",
-                callback_data=f"admin:day:{selected_day}",
-            )],
-            [InlineKeyboardButton(
-                "Choose another day", callback_data="admin:days"
-            )],
-        ]
-    )
+def day_setup_keyboard(selected_day: date) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Generate sessions", callback_data=f"admin:generate:{selected_day}")],
+        [InlineKeyboardButton("Back · session type", callback_data=f"admin:types:{selected_day}")],
+    ])
 
 
 def day_summary(selected_day: date, day_settings: dict) -> str:
@@ -142,8 +134,92 @@ def day_summary(selected_day: date, day_settings: dict) -> str:
         f"Day · {selected_day:%A, %Y-%m-%d}\n"
         f"Session type · {day_settings['session_type'].title()}\n"
         f"Capacity per session · {day_settings['capacity']} people\n\n"
-        "Adjust the capacity using the buttons below."
+        "Continue to enter the day's hours. Default capacities can be changed in Settings."
     )
+
+
+
+async def show_settings(query, context) -> None:
+    context.user_data.pop("setting_edit", None)
+    defaults = get_settings(ADMIN_ID)
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{label} · {defaults[field]}", callback_data=f"admin:setting:{field}"
+        )]
+        for field, label in SETTING_LABELS.items()
+    ]
+    keyboard.append([InlineKeyboardButton("Back · admin panel", callback_data="admin:home")])
+    await query.edit_message_text(
+        "Settings\n\nChoose a default to change.\n"
+        "Changes apply when you choose a type for newly generated sessions.\n"
+        "Saved sessions keep their existing capacity and times.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def show_setting_input(query, context, field: str) -> None:
+    context.user_data["setting_edit"] = {"field": field, "stage": "input"}
+    maximum = 1439 if field == "duration_minutes" else 2147483647
+    await query.edit_message_text(
+        f"{SETTING_LABELS[field]}\n\n"
+        f"Send a whole number between 1 and {maximum}.\n"
+        "You will review it before saving.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Back · Settings", callback_data="admin:settings")]
+        ]),
+    )
+
+
+async def show_time_input(query, context, selected_day: date, settings: dict) -> None:
+    context.user_data["awaiting_times"] = str(selected_day)
+    duration = settings.get("duration_minutes", get_settings(ADMIN_ID)["duration_minutes"])
+    await query.edit_message_text(
+        f"Generate sessions for {selected_day:%A, %Y-%m-%d}.\n\n"
+        "Send opening and closing times using the 24-hour clock.\n"
+        f"Example · 08:00 20:00\nDefault duration · {duration} minutes\n\n"
+        "Or add a number of equal sessions.\nExample · 08:00 20:00 6\n\n"
+        "End time must be later on the same day.\n"
+        "Confirming replaces this day's draft time slots.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Back · day setup", callback_data=f"admin:setup:{selected_day}")]
+        ]),
+    )
+
+
+async def show_saved_day(query, selected_day: date, saved: dict, page: int = 0) -> None:
+    sessions = saved["days"].get(str(selected_day), {}).get("sessions", [])
+    page_count = max(1, (len(sessions) + 19) // 20)
+    page = max(0, min(page, page_count - 1))
+    lines = [
+        f"Saved sessions · {selected_day:%A, %Y-%m-%d}",
+        f"Status · {'Published' if saved['published'] else 'Draft'}",
+        f"Total sessions · {len(sessions)}",
+        "",
+    ]
+    for session in sessions[page * 20:(page + 1) * 20]:
+        start = datetime.fromisoformat(session["start"])
+        end = datetime.fromisoformat(session["end"])
+        lines.append(
+            f"{start:%H:%M}–{end:%H:%M} · {session['session_type'].title()} · "
+            f"{session['capacity']} people"
+        )
+    keyboard = []
+    if page_count > 1:
+        lines.append(f"\nPage {page + 1} of {page_count}")
+        navigation = []
+        if page > 0:
+            navigation.append(InlineKeyboardButton("Previous", callback_data=f"admin:view:{selected_day}:{page - 1}"))
+        if page + 1 < page_count:
+            navigation.append(InlineKeyboardButton("Next", callback_data=f"admin:view:{selected_day}:{page + 1}"))
+        keyboard.append(navigation)
+    if not saved["published"]:
+        keyboard.append([InlineKeyboardButton(
+            "Regenerate this day", callback_data=f"admin:types:{selected_day}"
+        )])
+    keyboard.append([InlineKeyboardButton(
+        "Back · week", callback_data=f"admin:week:{saved['start_date']}"
+    )])
+    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def admin_buttons(
@@ -160,6 +236,43 @@ async def admin_buttons(
     await query.answer()
     action = query.data or ""
     today = datetime.now(GYM_TIMEZONE).date()
+
+    if action == "admin:home":
+        context.user_data.pop("awaiting_times", None)
+        context.user_data.pop("session_preview", None)
+        context.user_data.pop("setting_edit", None)
+        await query.edit_message_text(
+            "Gym admin panel",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📅 Create / open week", callback_data="admin:create_week")],
+                [InlineKeyboardButton("⚙️ Settings", callback_data="admin:settings")],
+            ]),
+        )
+        return
+
+    if action == "admin:settings" or action.startswith("admin:setting"):
+        context.user_data.pop("awaiting_times", None)
+        context.user_data.pop("session_preview", None)
+        if action == "admin:settings":
+            await show_settings(query, context)
+        elif action.startswith("admin:setting:"):
+            field = action.removeprefix("admin:setting:")
+            if field in SETTING_LABELS:
+                await show_setting_input(query, context, field)
+        elif action.startswith("admin:setting_back:"):
+            field = action.removeprefix("admin:setting_back:")
+            if field in SETTING_LABELS:
+                await show_setting_input(query, context, field)
+        elif action.startswith("admin:setting_confirm:"):
+            pending = context.user_data.get("setting_edit")
+            if pending is None or pending.get("id") != action.split(":")[-1]:
+                await show_settings(query, context)
+                return
+            update_setting(ADMIN_ID, pending["field"], pending["value"])
+            await show_settings(query, context)
+        return
+
+    context.user_data.pop("setting_edit", None)
 
     if action.startswith("admin:confirm:") or action.startswith("admin:back:"):
         preview = context.user_data.get("session_preview")
@@ -182,7 +295,7 @@ async def admin_buttons(
                 context.user_data.pop("session_preview", None)
                 await query.edit_message_text(
                     "The first session has already started. Generate new times.",
-                    reply_markup=capacity_keyboard(selected_day),
+                    reply_markup=day_setup_keyboard(selected_day),
                 )
                 return
             candidate = copy.deepcopy(draft)
@@ -198,18 +311,13 @@ async def admin_buttons(
                 )
                 return
             context.user_data["week_draft"] = candidate
-            message = (
-                f"Saved {len(preview['sessions'])} sessions to the draft database.\n"
-                "You can reopen this week after restarting the bot.\n"
-                "Choose another day to continue, then use Publish week."
-            )
         else:
-            message = "Returned to day settings. Preview discarded."
+            context.user_data.pop("session_preview", None)
+            await show_time_input(query, context, selected_day, day_settings)
+            return
 
         context.user_data.pop("session_preview", None)
-        await query.edit_message_text(
-            message, reply_markup=capacity_keyboard(selected_day)
-        )
+        await show_saved_day(query, selected_day, load_week(ADMIN_ID, draft["start_date"]))
         return
 
     context.user_data.pop("awaiting_times", None)
@@ -282,6 +390,7 @@ async def admin_buttons(
                     f"Next week · {next_saturday:%Y-%m-%d}",
                     callback_data=f"admin:week:{next_saturday}",
                 )],
+                [InlineKeyboardButton("Back · admin panel", callback_data="admin:home")],
             ]
         )
         await query.edit_message_text(
@@ -329,7 +438,7 @@ async def admin_buttons(
 
     # Day-specific buttons carry their date to prevent edits to another day.
     parts = action.split(":")
-    if len(parts) < 3 or parts[1] not in ("day", "type", "capacity", "generate", "view"):
+    if len(parts) < 3 or parts[1] not in ("day", "types", "type", "setup", "generate", "view"):
         return
 
     selected_day = date.fromisoformat(parts[2])
@@ -349,29 +458,11 @@ async def admin_buttons(
 
     selected_date = selected_day.isoformat()
     saved = load_week(ADMIN_ID, draft["start_date"])
-    if parts[1] == "view" or (parts[1] == "day" and saved["published"]):
-        settings = saved["days"].get(selected_date, {})
-        sessions = settings.get("sessions", [])
-        await query.edit_message_text(
-            f"Saved day · {selected_day:%A, %Y-%m-%d}\n"
-            f"Sessions · {len(sessions)}\n"
-            f"Status · {'Published' if saved['published'] else 'Draft'}",
-            reply_markup=day_keyboard(week_start),
-        )
-        chunk = ""
-        for session in sessions:
-            start = datetime.fromisoformat(session["start"])
-            end = datetime.fromisoformat(session["end"])
-            line = (
-                f"{start:%H:%M}–{end:%H:%M} · {session['session_type']} · "
-                f"capacity {session['capacity']}\n"
-            )
-            if len(chunk) + len(line) > 3500:
-                await query.message.reply_text(chunk)
-                chunk = ""
-            chunk += line
-        if chunk:
-            await query.message.reply_text(chunk)
+    has_sessions = bool(saved["days"].get(selected_date, {}).get("sessions"))
+    if parts[1] == "view" or (parts[1] == "day" and has_sessions):
+        draft["selected_day"] = selected_date
+        page = int(parts[3]) if parts[1] == "view" and len(parts) == 4 else 0
+        await show_saved_day(query, selected_day, saved, page)
         return
 
     if saved["published"]:
@@ -381,7 +472,7 @@ async def admin_buttons(
         )
         return
 
-    if parts[1] == "day":
+    if parts[1] in ("day", "types"):
         draft["selected_day"] = selected_date
         await query.edit_message_text(
             f"Selected day · {selected_day:%A, %Y-%m-%d}\n\n"
@@ -408,53 +499,32 @@ async def admin_buttons(
                 reply_markup=type_keyboard(selected_day),
             )
             return
-        context.user_data["awaiting_times"] = selected_date
-        await query.edit_message_text(
-            f"Generate sessions for {selected_day:%A, %Y-%m-%d}.\n\n"
-            "Send opening and closing times, using the 24-hour clock.\n"
-            "Example · 08:00 20:00\n"
-            "This uses the default duration of 2 hours.\n\n"
-            "Or add the number of equal sessions.\n"
-            "Example · 08:00 20:00 6\n\n"
-            "End time must be later on the same day.\n"
-            "Confirming will replace this day's draft time slots.\n"
-            "Send /admin to cancel.",
-        )
+        await show_time_input(query, context, selected_day, day_settings)
+        return
+
+    if parts[1] == "setup":
+        day_settings = draft["days"].get(selected_date)
+        if day_settings is None or "capacity" not in day_settings:
+            await query.edit_message_text("Choose a session type.", reply_markup=type_keyboard(selected_day))
+            return
+        await query.edit_message_text(day_summary(selected_day, day_settings), reply_markup=day_setup_keyboard(selected_day))
         return
 
     if len(parts) != 4:
         return
 
-    if parts[1] == "type":
-        session_type = parts[3]
-        if session_type not in DEFAULT_CAPACITIES:
-            return
-
-        day_settings = draft["days"].setdefault(selected_date, {})
-        day_settings["session_type"] = session_type
-        day_settings["capacity"] = DEFAULT_CAPACITIES[session_type]
-
-    else:
-        day_settings = draft["days"].get(selected_date)
-        if day_settings is None or "capacity" not in day_settings:
-            await query.edit_message_text(
-                "Choose the session type first.",
-                reply_markup=type_keyboard(selected_day),
-            )
-            return
-
-        if parts[3] == "increase":
-            day_settings["capacity"] += 1
-        elif parts[3] == "decrease":
-            if day_settings["capacity"] == 1:
-                return
-            day_settings["capacity"] -= 1
-        else:
-            return
+    if parts[1] != "type" or parts[3] not in ("private", "public"):
+        return
+    session_type = parts[3]
+    defaults = get_settings(ADMIN_ID)
+    day_settings = draft["days"].setdefault(selected_date, {})
+    day_settings["session_type"] = session_type
+    day_settings["capacity"] = defaults[f"{session_type}_capacity"]
+    day_settings["duration_minutes"] = defaults["duration_minutes"]
 
     await query.edit_message_text(
         day_summary(selected_day, day_settings),
-        reply_markup=capacity_keyboard(selected_day),
+        reply_markup=day_setup_keyboard(selected_day),
     )
 
 
@@ -486,9 +556,9 @@ def generate_sessions(text: str, selected_day: date, settings: dict) -> list[dic
             raise ValueError("These hours cannot divide into that many equal sessions at minute precision. Choose another count or different times.")
         duration = total_minutes // count
     else:
-        duration = 120
+        duration = settings.get("duration_minutes", 120)
         if total_minutes % duration:
-            raise ValueError("These hours do not divide into 2-hour sessions. Add a session count or change the times.")
+            raise ValueError(f"These hours do not divide into {duration}-minute sessions. Add a session count or change the times.")
         count = total_minutes // duration
 
     midnight = datetime.combine(selected_day, datetime.min.time(), tzinfo=GYM_TIMEZONE)
@@ -513,6 +583,26 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if update.effective_user is None or update.effective_user.id != ADMIN_ID:
         return
     if update.message is None or update.message.text is None:
+        return
+
+    pending = context.user_data.get("setting_edit")
+    if pending is not None:
+        if pending.get("stage") != "input":
+            await update.message.reply_text("Use Confirm or Back on the settings preview.")
+            return
+        text = update.message.text.strip()
+        maximum = 1439 if pending["field"] == "duration_minutes" else 2147483647
+        if not text.isascii() or not text.isdigit() or len(text) > 10 or not 1 <= int(text) <= maximum:
+            await update.message.reply_text(f"Send a whole number between 1 and {maximum}.")
+            return
+        pending.update(value=int(text), stage="preview", id=uuid4().hex[:12])
+        await update.message.reply_text(
+            f"{SETTING_LABELS[pending['field']]}\nNew default · {pending['value']}\n\nSave this change?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Confirm", callback_data=f"admin:setting_confirm:{pending['id']}")],
+                [InlineKeyboardButton("Back", callback_data=f"admin:setting_back:{pending['field']}")],
+            ]),
+        )
         return
 
     selected_date = context.user_data.get("awaiting_times")
