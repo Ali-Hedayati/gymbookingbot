@@ -1,4 +1,6 @@
 import os
+import copy
+import sqlite3
 import re
 from uuid import uuid4
 from datetime import date, datetime, timedelta
@@ -15,6 +17,9 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+
+from storage import initialize_database, load_week, save_draft, publish_week, upcoming_sessions
 
 
 ADMIN_ID = 7265018265
@@ -47,7 +52,7 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("awaiting_times", None)
     context.user_data.pop("session_preview", None)
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("📅 Create week", callback_data="admin:create_week")]]
+        [[InlineKeyboardButton("📅 Create / open week", callback_data="admin:create_week")]]
     )
     await update.message.reply_text(
         "Welcome to the gym admin panel! 🏋️", reply_markup=keyboard
@@ -69,6 +74,11 @@ def day_keyboard(week_start: date) -> InlineKeyboardMarkup:
             )]
         )
 
+    keyboard.append(
+        [InlineKeyboardButton(
+            "Publish week", callback_data=f"admin:publish:{week_start}"
+        )]
+    )
     keyboard.append(
         [InlineKeyboardButton(
             "Choose another week", callback_data="admin:create_week"
@@ -98,6 +108,10 @@ def type_keyboard(selected_day: date) -> InlineKeyboardMarkup:
 def capacity_keyboard(selected_day: date) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
+            [InlineKeyboardButton(
+                "View saved sessions",
+                callback_data=f"admin:view:{selected_day}",
+            )],
             [InlineKeyboardButton(
                 "Generate sessions",
                 callback_data=f"admin:generate:{selected_day}",
@@ -171,10 +185,23 @@ async def admin_buttons(
                     reply_markup=capacity_keyboard(selected_day),
                 )
                 return
-            day_settings["sessions"] = preview["sessions"]
+            candidate = copy.deepcopy(draft)
+            candidate["days"][preview["day"]]["sessions"] = preview["sessions"]
+            try:
+                candidate["revision"] = save_draft(ADMIN_ID, candidate)
+            except ValueError as error:
+                await query.edit_message_text(str(error))
+                return
+            except sqlite3.Error:
+                await query.edit_message_text(
+                    "Could not save the database. Check disk space and folder permissions, then reopen /admin."
+                )
+                return
+            context.user_data["week_draft"] = candidate
             message = (
-                f"Added {len(preview['sessions'])} sessions to the week draft.\n"
-                "They remain in memory until the bot stops."
+                f"Saved {len(preview['sessions'])} sessions to the draft database.\n"
+                "You can reopen this week after restarting the bot.\n"
+                "Choose another day to continue, then use Publish week."
             )
         else:
             message = "Returned to day settings. Preview discarded."
@@ -187,6 +214,59 @@ async def admin_buttons(
 
     context.user_data.pop("awaiting_times", None)
     context.user_data.pop("session_preview", None)
+
+    if action.startswith("admin:publish:") or action.startswith("admin:publish_ok:"):
+        parts = action.split(":")
+        week_start = parts[2]
+        saved = load_week(ADMIN_ID, week_start)
+        if saved["published"]:
+            await query.edit_message_text(
+                "This week is already published.",
+                reply_markup=day_keyboard(date.fromisoformat(week_start)),
+            )
+            return
+        sessions = upcoming_sessions(saved, datetime.now(GYM_TIMEZONE))
+        if not sessions:
+            await query.edit_message_text(
+                "Confirm at least one day with future sessions before publishing.",
+                reply_markup=day_keyboard(date.fromisoformat(week_start)),
+            )
+            return
+        if parts[1] == "publish":
+            total = sum(len(day.get("sessions", [])) for day in saved["days"].values())
+            await query.edit_message_text(
+                f"Publish week starting {week_start}?\n"
+                f"Upcoming sessions · {len(sessions)}\n"
+                f"Past or started sessions skipped · {total - len(sessions)}\n\n"
+                "This publishes the confirmed, saved sessions.\n"
+                "Published weeks are read-only in this version.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "Yes, publish week",
+                        callback_data=f"admin:publish_ok:{week_start}:{saved['revision']}:{len(sessions)}",
+                    )],
+                    [InlineKeyboardButton("Back", callback_data=f"admin:week:{week_start}")],
+                ]),
+            )
+            return
+        try:
+            count = publish_week(
+                ADMIN_ID, week_start, int(parts[3]), int(parts[4]), datetime.now(GYM_TIMEZONE)
+            )
+        except ValueError as error:
+            await query.edit_message_text(
+                str(error), reply_markup=day_keyboard(date.fromisoformat(week_start))
+            )
+            return
+        except sqlite3.Error:
+            await query.edit_message_text("Publishing failed. Nothing was published. Reopen /admin to retry.")
+            return
+        context.user_data["week_draft"] = load_week(ADMIN_ID, week_start)
+        await query.edit_message_text(
+            f"Published {count} sessions.\nYou can reopen the week to view them.",
+            reply_markup=day_keyboard(date.fromisoformat(week_start)),
+        )
+        return
 
     if action == "admin:create_week":
         days_since_saturday = (today.weekday() - 5) % 7
@@ -221,13 +301,14 @@ async def admin_buttons(
             )
             return
 
-        context.user_data["week_draft"] = {
-            "start_date": week_start.isoformat(),
-            "days": {},
-        }
+        saved = load_week(ADMIN_ID, week_start.isoformat())
+        context.user_data["week_draft"] = saved
+        saved_count = sum(len(day.get("sessions", [])) for day in saved["days"].values())
+        status = "Published" if saved["published"] else "Draft"
         await query.edit_message_text(
             f"Week of {week_start:%Y-%m-%d} to {week_end:%Y-%m-%d}\n\n"
-            "Choose a day to configure.",
+            f"Status · {status}\nSaved sessions · {saved_count}\n\n"
+            "Choose a day to view or configure.",
             reply_markup=day_keyboard(week_start),
         )
         return
@@ -248,7 +329,7 @@ async def admin_buttons(
 
     # Day-specific buttons carry their date to prevent edits to another day.
     parts = action.split(":")
-    if len(parts) < 3 or parts[1] not in ("day", "type", "capacity", "generate"):
+    if len(parts) < 3 or parts[1] not in ("day", "type", "capacity", "generate", "view"):
         return
 
     selected_day = date.fromisoformat(parts[2])
@@ -267,6 +348,38 @@ async def admin_buttons(
         return
 
     selected_date = selected_day.isoformat()
+    saved = load_week(ADMIN_ID, draft["start_date"])
+    if parts[1] == "view" or (parts[1] == "day" and saved["published"]):
+        settings = saved["days"].get(selected_date, {})
+        sessions = settings.get("sessions", [])
+        await query.edit_message_text(
+            f"Saved day · {selected_day:%A, %Y-%m-%d}\n"
+            f"Sessions · {len(sessions)}\n"
+            f"Status · {'Published' if saved['published'] else 'Draft'}",
+            reply_markup=day_keyboard(week_start),
+        )
+        chunk = ""
+        for session in sessions:
+            start = datetime.fromisoformat(session["start"])
+            end = datetime.fromisoformat(session["end"])
+            line = (
+                f"{start:%H:%M}–{end:%H:%M} · {session['session_type']} · "
+                f"capacity {session['capacity']}\n"
+            )
+            if len(chunk) + len(line) > 3500:
+                await query.message.reply_text(chunk)
+                chunk = ""
+            chunk += line
+        if chunk:
+            await query.message.reply_text(chunk)
+        return
+
+    if saved["published"]:
+        await query.edit_message_text(
+            "This week is published and read-only. Choose a day to view it.",
+            reply_markup=day_keyboard(week_start),
+        )
+        return
 
     if parts[1] == "day":
         draft["selected_day"] = selected_date
@@ -410,6 +523,10 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     settings = draft["days"].get(selected_date)
     if settings is None:
         return
+    if load_week(ADMIN_ID, draft["start_date"])["published"]:
+        context.user_data.pop("awaiting_times", None)
+        await update.message.reply_text("This week is already published. Reopen /admin to view it.")
+        return
     selected_day = date.fromisoformat(selected_date)
     try:
         sessions = generate_sessions(update.message.text, selected_day, settings)
@@ -457,6 +574,7 @@ def main() -> None:
     if not token:
         raise SystemExit("Add BOT_TOKEN to your .env file.")
 
+    initialize_database()
     application = Application.builder().token(token).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("myid", my_id))
