@@ -62,6 +62,7 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     context.user_data.pop("awaiting_times", None)
+    context.user_data.pop("awaiting_mode", None)
     context.user_data.pop("session_preview", None)
     context.user_data.pop("setting_edit", None)
     keyboard = InlineKeyboardMarkup(
@@ -170,18 +171,53 @@ async def show_setting_input(query, context, field: str) -> None:
     )
 
 
-async def show_time_input(query, context, selected_day: date, settings: dict) -> None:
-    context.user_data["awaiting_times"] = str(selected_day)
+async def show_generation_options(query, selected_day: date, settings: dict) -> None:
     duration = settings.get("duration_minutes", get_settings(ADMIN_ID)["duration_minutes"])
     await query.edit_message_text(
         f"Generate sessions for {selected_day:%A, %Y-%m-%d}.\n\n"
-        "Send opening and closing times using the 24-hour clock.\n"
-        f"Example · 08:00 20:00\nDefault duration · {duration} minutes\n\n"
-        "Or add a number of equal sessions.\nExample · 08:00 20:00 6\n\n"
+        "How would you like to divide the day's working hours?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"Use default duration · {duration} minutes",
+                callback_data=f"admin:duration:{selected_day}",
+            )],
+            [InlineKeyboardButton(
+                "Set number of sessions", callback_data=f"admin:count:{selected_day}"
+            )],
+            [InlineKeyboardButton(
+                "Back · day setup", callback_data=f"admin:setup:{selected_day}"
+            )],
+        ]),
+    )
+
+
+async def show_time_input(
+    query, context, selected_day: date, settings: dict, mode: str
+) -> None:
+    context.user_data["awaiting_times"] = str(selected_day)
+    context.user_data["awaiting_mode"] = mode
+    duration = settings.get("duration_minutes", get_settings(ADMIN_ID)["duration_minutes"])
+    if mode == "duration":
+        instructions = (
+            f"Use default duration · {duration} minutes\n\n"
+            "Send opening and closing times using the 24-hour clock.\n"
+            "Example · 08:00 20:00"
+        )
+    else:
+        instructions = (
+            "Set number of equal sessions\n\n"
+            "Send opening time, closing time, and number of sessions.\n"
+            "Example · 08:00 20:00 6"
+        )
+    await query.edit_message_text(
+        f"Generate sessions for {selected_day:%A, %Y-%m-%d}.\n\n"
+        f"{instructions}\n\n"
         "End time must be later on the same day.\n"
         "Confirming replaces this day's draft time slots.",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Back · day setup", callback_data=f"admin:setup:{selected_day}")]
+            [InlineKeyboardButton(
+                "Back · generation options", callback_data=f"admin:generate:{selected_day}"
+            )]
         ]),
     )
 
@@ -239,6 +275,7 @@ async def admin_buttons(
 
     if action == "admin:home":
         context.user_data.pop("awaiting_times", None)
+        context.user_data.pop("awaiting_mode", None)
         context.user_data.pop("session_preview", None)
         context.user_data.pop("setting_edit", None)
         await query.edit_message_text(
@@ -252,6 +289,7 @@ async def admin_buttons(
 
     if action == "admin:settings" or action.startswith("admin:setting"):
         context.user_data.pop("awaiting_times", None)
+        context.user_data.pop("awaiting_mode", None)
         context.user_data.pop("session_preview", None)
         if action == "admin:settings":
             await show_settings(query, context)
@@ -313,7 +351,7 @@ async def admin_buttons(
             context.user_data["week_draft"] = candidate
         else:
             context.user_data.pop("session_preview", None)
-            await show_time_input(query, context, selected_day, day_settings)
+            await show_time_input(query, context, selected_day, day_settings, preview["mode"])
             return
 
         context.user_data.pop("session_preview", None)
@@ -321,6 +359,7 @@ async def admin_buttons(
         return
 
     context.user_data.pop("awaiting_times", None)
+    context.user_data.pop("awaiting_mode", None)
     context.user_data.pop("session_preview", None)
 
     if action.startswith("admin:publish:") or action.startswith("admin:publish_ok:"):
@@ -438,7 +477,7 @@ async def admin_buttons(
 
     # Day-specific buttons carry their date to prevent edits to another day.
     parts = action.split(":")
-    if len(parts) < 3 or parts[1] not in ("day", "types", "type", "setup", "generate", "view"):
+    if len(parts) < 3 or parts[1] not in ("day", "types", "type", "setup", "generate", "duration", "count", "view"):
         return
 
     selected_day = date.fromisoformat(parts[2])
@@ -488,7 +527,7 @@ async def admin_buttons(
         )
         return
 
-    if parts[1] == "generate":
+    if parts[1] in ("generate", "duration", "count"):
         if query.message is None or query.message.chat.type != "private":
             await query.edit_message_text("Open the bot in a private chat to enter times.")
             return
@@ -499,7 +538,10 @@ async def admin_buttons(
                 reply_markup=type_keyboard(selected_day),
             )
             return
-        await show_time_input(query, context, selected_day, day_settings)
+        if parts[1] == "generate":
+            await show_generation_options(query, selected_day, day_settings)
+        else:
+            await show_time_input(query, context, selected_day, day_settings, parts[1])
         return
 
     if parts[1] == "setup":
@@ -615,9 +657,25 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     if load_week(ADMIN_ID, draft["start_date"])["published"]:
         context.user_data.pop("awaiting_times", None)
+        context.user_data.pop("awaiting_mode", None)
         await update.message.reply_text("This week is already published. Reopen /admin to view it.")
         return
     selected_day = date.fromisoformat(selected_date)
+    mode = context.user_data.get("awaiting_mode")
+    fields = update.message.text.split()
+    if mode == "duration" and len(fields) != 2:
+        await update.message.reply_text(
+            "For default duration, send only opening and closing times. Example · 08:00 20:00"
+        )
+        return
+    if mode == "count" and len(fields) != 3:
+        await update.message.reply_text(
+            "Include the number of sessions. Example · 08:00 20:00 6"
+        )
+        return
+    if mode not in ("duration", "count"):
+        await update.message.reply_text("Choose a generation option first. Send /admin to reopen the day.")
+        return
     try:
         sessions = generate_sessions(update.message.text, selected_day, settings)
     except ValueError as error:
@@ -626,11 +684,13 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     preview_id = uuid4().hex[:12]
     context.user_data.pop("awaiting_times", None)
+    context.user_data.pop("awaiting_mode", None)
     context.user_data["session_preview"] = {
         "id": preview_id,
         "week_start": draft["start_date"],
         "day": selected_date,
         "sessions": sessions,
+        "mode": mode,
     }
 
     lines = [f"Preview · {selected_day:%A, %Y-%m-%d}"]
