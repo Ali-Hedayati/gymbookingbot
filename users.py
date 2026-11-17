@@ -174,6 +174,7 @@ async def handle_users_button(update, context) -> None:
         await query.edit_message_text(
             customer_summary(customer),
             reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton('Bookings and edit customer', callback_data=f"p:customer:{customer['id']}")],
                 [InlineKeyboardButton("Back · results", callback_data="admin:users:results")]
             ]),
         )

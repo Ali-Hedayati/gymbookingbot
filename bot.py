@@ -2,6 +2,8 @@ import os
 import copy
 import sqlite3
 import re
+import phase_one
+import bookings
 from uuid import uuid4
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -47,9 +49,11 @@ SETTING_LABELS = {
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    for key in ("awaiting_times", "awaiting_mode", "session_preview", "setting_edit", "customer_flow"):
+    for key in ("awaiting_times", "awaiting_mode", "session_preview", "setting_edit", "customer_flow", "phase_flow", "phase_confirm"):
         context.user_data.pop(key, None)
     await customer_start(update, context)
+    if update.effective_chat.type == "private" and phase_one.customer_by_telegram(update.effective_user.id):
+        await phase_one.send_customer_menu(update.message)
 
 
 async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -69,6 +73,11 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Open a private chat with this bot to use /admin.")
+        return
+    context.user_data.pop("phase_flow", None)
+    context.user_data.pop("phase_confirm", None)
     context.user_data.pop("awaiting_times", None)
     context.user_data.pop("awaiting_mode", None)
     context.user_data.pop("session_preview", None)
@@ -78,6 +87,8 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [
             [InlineKeyboardButton("📅 Create / open week", callback_data="admin:create_week")],
             [InlineKeyboardButton("👥 Users", callback_data="admin:users")],
+            [InlineKeyboardButton("🧾 Payment requests", callback_data="p:requests:0")],
+            [InlineKeyboardButton("📋 Sessions and bookings", callback_data="p:aslots:0")],
             [InlineKeyboardButton("⚙️ Settings", callback_data="admin:settings")],
         ]
     )
@@ -121,6 +132,7 @@ def type_keyboard(selected_day: date) -> InlineKeyboardMarkup:
     has_sessions = bool(saved["days"].get(str(selected_day), {}).get("sessions"))
     back = f"admin:day:{selected_day}" if has_sessions else "admin:days"
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Enter a session manually", callback_data=f"p:manual:{selected_day}")],
         [InlineKeyboardButton(
             f"🔒 Private · {defaults['private_capacity']} people",
             callback_data=f"admin:type:{selected_day}:private",
@@ -159,6 +171,7 @@ async def show_settings(query, context) -> None:
         )]
         for field, label in SETTING_LABELS.items()
     ]
+    keyboard.append([InlineKeyboardButton("Payment settings", callback_data="p:config")])
     keyboard.append([InlineKeyboardButton("Back · admin panel", callback_data="admin:home")])
     await query.edit_message_text(
         "Settings\n\nChoose a default to change.\n"
@@ -259,6 +272,14 @@ async def show_saved_day(query, selected_day: date, saved: dict, page: int = 0) 
             navigation.append(InlineKeyboardButton("Next", callback_data=f"admin:view:{selected_day}:{page + 1}"))
         keyboard.append(navigation)
     if not saved["published"]:
+        for index, slot in enumerate(sessions[page * 20:(page + 1) * 20], start=page * 20):
+            start = datetime.fromisoformat(slot["start"])
+            end = datetime.fromisoformat(slot["end"])
+            keyboard.append([InlineKeyboardButton(
+                f"Edit {start:%H:%M}–{end:%H:%M} · {slot['session_type']} · {slot['capacity']}",
+                callback_data=f"p:ds:{selected_day}:{index}:{saved['revision']}",
+            )])
+        keyboard.append([InlineKeyboardButton("Add a session", callback_data=f"p:manual:{selected_day}")])
         keyboard.append([InlineKeyboardButton(
             "Regenerate this day", callback_data=f"admin:types:{selected_day}"
         )])
@@ -269,7 +290,7 @@ async def show_saved_day(query, selected_day: date, saved: dict, page: int = 0) 
 
 
 async def admin_buttons(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    update: Update, context: ContextTypes.DEFAULT_TYPE, action_override=None, answered=False
 ) -> None:
     query = update.callback_query
     if query is None:
@@ -279,8 +300,15 @@ async def admin_buttons(
         await query.answer("Admin access required.", show_alert=True)
         return
 
-    await query.answer()
-    action = query.data or ""
+    if query.message is None or query.message.chat.type != "private":
+        if not answered:
+            await query.answer("Use /admin in a private chat.", show_alert=True)
+        return
+    if not answered:
+        await query.answer()
+    action = action_override or query.data or ""
+    context.user_data.pop("phase_flow", None)
+    context.user_data.pop("phase_confirm", None)
     today = datetime.now(GYM_TIMEZONE).date()
 
     if action.startswith("admin:users"):
@@ -294,6 +322,24 @@ async def admin_buttons(
 
     context.user_data.pop("customer_flow", None)
 
+    if action.startswith("admin:toggle:") or action.startswith("admin:preview:"):
+        preview=context.user_data.get("session_preview")
+        parts=action.split(":")
+        if preview is None or preview['id']!=parts[2]:
+            await query.edit_message_text("Preview expired. Reopen /admin.")
+            return
+        if parts[1]=="toggle":
+            index=int(parts[3])
+            slot=preview['sessions'][index]
+            new_type='private' if slot['session_type']=='public' else 'public'
+            slot['session_type']=new_type
+            slot['capacity']=get_settings(ADMIN_ID)[new_type+'_capacity']
+            page=index//12
+        else:
+            page=int(parts[3])
+        await show_session_preview(update,context,page)
+        return
+
     if action == "admin:home":
         context.user_data.pop("awaiting_times", None)
         context.user_data.pop("awaiting_mode", None)
@@ -304,7 +350,9 @@ async def admin_buttons(
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📅 Create / open week", callback_data="admin:create_week")],
                 [InlineKeyboardButton("👥 Users", callback_data="admin:users")],
-            [InlineKeyboardButton("⚙️ Settings", callback_data="admin:settings")],
+                [InlineKeyboardButton("🧾 Payment requests", callback_data="p:requests:0")],
+                [InlineKeyboardButton("📋 Sessions and bookings", callback_data="p:aslots:0")],
+                [InlineKeyboardButton("⚙️ Settings", callback_data="admin:settings")],
             ]),
         )
         return
@@ -408,7 +456,7 @@ async def admin_buttons(
                 f"Upcoming sessions · {len(sessions)}\n"
                 f"Past or started sessions skipped · {total - len(sessions)}\n\n"
                 "This publishes the confirmed, saved sessions.\n"
-                "Published weeks are read-only in this version.",
+                "You can manage individual published sessions from the admin panel.",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(
                         "Yes, publish week",
@@ -520,6 +568,9 @@ async def admin_buttons(
     selected_date = selected_day.isoformat()
     saved = load_week(ADMIN_ID, draft["start_date"])
     has_sessions = bool(saved["days"].get(selected_date, {}).get("sessions"))
+    if saved['published']:
+        await phase_one.show_live_day(update,context,ADMIN_ID,selected_day)
+        return
     if parts[1] == "view" or (parts[1] == "day" and has_sessions):
         draft["selected_day"] = selected_date
         page = int(parts[3]) if parts[1] == "view" and len(parts) == 4 else 0
@@ -527,10 +578,7 @@ async def admin_buttons(
         return
 
     if saved["published"]:
-        await query.edit_message_text(
-            "This week is published and read-only. Choose a day to view it.",
-            reply_markup=day_keyboard(week_start),
-        )
+        await phase_one.show_live_day(update,context,ADMIN_ID,selected_day)
         return
 
     if parts[1] in ("day", "types"):
@@ -649,6 +697,9 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if update.message is None or update.message.text is None:
         return
 
+    if await phase_one.handle_text(update,context,ADMIN_ID):
+        return
+
     if context.user_data.get("customer_flow") is not None:
         await handle_customer_text(update, context)
         return
@@ -719,55 +770,99 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "mode": mode,
     }
 
-    lines = [f"Preview · {selected_day:%A, %Y-%m-%d}"]
-    lines.append(f"{settings['session_type'].title()} · capacity {settings['capacity']} per session")
-    lines.append(f"Total sessions · {len(sessions)}")
-    for index, session in enumerate(sessions, start=1):
-        start = datetime.fromisoformat(session["start"])
-        end = datetime.fromisoformat(session["end"])
-        lines.append(f"{index}. {start:%H:%M}–{end:%H:%M}")
+    await show_session_preview(update,context)
 
-    # Split long previews so every message fits Telegram's text limit.
-    chunk = ""
-    for line in lines:
-        if len(chunk) + len(line) + 1 > 3500:
-            await update.message.reply_text(chunk)
-            chunk = ""
-        chunk += line + "\n"
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Confirm day", callback_data=f"admin:confirm:{preview_id}")],
-        [InlineKeyboardButton("Back", callback_data=f"admin:back:{preview_id}")],
+async def show_session_preview(update,context,page=0):
+    preview=context.user_data['session_preview']
+    slots=preview['sessions']
+    page_count=max(1,(len(slots)+11)//12)
+    page=max(0,min(page,page_count-1))
+    rows=[]
+    for index,slot in enumerate(slots[page*12:(page+1)*12],start=page*12):
+        start=datetime.fromisoformat(slot['start']);end=datetime.fromisoformat(slot['end'])
+        icon='🔒' if slot['session_type']=='private' else '👥'
+        rows.append([InlineKeyboardButton(
+            f"{icon} {start:%H:%M}–{end:%H:%M} · {slot['session_type']} · {slot['capacity']}",
+            callback_data=f"admin:toggle:{preview['id']}:{index}",
+        )])
+    nav=[]
+    if page>0: nav.append(InlineKeyboardButton('Previous',callback_data=f"admin:preview:{preview['id']}:{page-1}"))
+    if page+1<page_count: nav.append(InlineKeyboardButton('Next',callback_data=f"admin:preview:{preview['id']}:{page+1}"))
+    if nav: rows.append(nav)
+    rows.extend([
+        [InlineKeyboardButton('Confirm day',callback_data=f"admin:confirm:{preview['id']}")],
+        [InlineKeyboardButton('Back',callback_data=f"admin:back:{preview['id']}")],
     ])
-    await update.message.reply_text(chunk, reply_markup=keyboard)
+    await phase_one.render(update,
+        f"Preview · {preview['day']}\nSessions · {len(slots)}\nPage {page+1} of {page_count}\n\n"
+        "Tap a session to switch Private / Public. Its capacity follows the default for that type.\n"
+        "Confirm day when the list is ready.", rows)
+
+
+async def registration(update,context):
+    await contact_registration(update,context)
+    if phase_one.customer_by_telegram(update.effective_user.id):
+        await phase_one.send_customer_menu(update.message)
+
+
+async def phase_callback(update,context):
+    for key in ('awaiting_times','awaiting_mode','session_preview','setting_edit','customer_flow'):
+        context.user_data.pop(key,None)
+    await phase_one.handle_callback(update,context,ADMIN_ID)
+
+
+async def receipt_image(update,context):
+    await phase_one.receipt_image(update,context,ADMIN_ID)
+
+
+async def error_handler(update,context):
+    import logging
+    logging.getLogger(__name__).error('Bot update failed',exc_info=(type(context.error),context.error,context.error.__traceback__))
+    if update and update.effective_message:
+        try:
+            await update.effective_message.reply_text('Something went wrong. Please reopen /start or /admin and try again.')
+        except Exception:
+            pass
 
 
 def main() -> None:
+    global ADMIN_ID
     env_path = Path(__file__).resolve().parent / ".env"
     load_dotenv(env_path)
 
+    admin_value=os.getenv("ADMIN_ID",str(ADMIN_ID)).strip()
+    if not admin_value.isascii() or not admin_value.isdigit() or not 1<=int(admin_value)<=9223372036854775807:
+        raise SystemExit("ADMIN_ID must be a positive numeric Telegram user ID.")
+    ADMIN_ID=int(admin_value)
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
         raise SystemExit("Add BOT_TOKEN to your .env file.")
 
     initialize_database()
-    application = Application.builder().token(token).build()
+    bookings.initialize()
+    phase_one.admin_router=admin_buttons
+    application = (Application.builder().token(token)
+                   .post_init(phase_one.post_init).post_shutdown(phase_one.post_shutdown).build())
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("myid", my_id))
     application.add_handler(CommandHandler("admin", admin))
+    application.add_handler(CallbackQueryHandler(phase_callback,pattern=r"^p:"))
     application.add_handler(
         CallbackQueryHandler(admin_buttons, pattern=r"^admin:")
     )
 
     application.add_handler(
-        MessageHandler(filters.CONTACT & filters.ChatType.PRIVATE, contact_registration)
+        MessageHandler(filters.CONTACT & filters.ChatType.PRIVATE, registration)
     )
+    application.add_handler(MessageHandler((filters.PHOTO | filters.Document.IMAGE) & filters.ChatType.PRIVATE,receipt_image))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, admin_text)
     )
 
+    application.add_error_handler(error_handler)
     print("Starting bot. Press Ctrl+C to stop.")
-    application.run_polling()
+    application.run_polling(bootstrap_retries=3)
 
 
 if __name__ == "__main__":
