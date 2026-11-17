@@ -19,6 +19,13 @@ from telegram.ext import (
 )
 
 
+from users import (
+    contact_registration,
+    customer_start,
+    handle_customer_text,
+    handle_users_button,
+)
+
 from storage import (
     get_settings,
     initialize_database,
@@ -40,8 +47,9 @@ SETTING_LABELS = {
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message is not None:
-        await update.message.reply_text("Welcome to the gym booking bot! 🏋️")
+    for key in ("awaiting_times", "awaiting_mode", "session_preview", "setting_edit", "customer_flow"):
+        context.user_data.pop(key, None)
+    await customer_start(update, context)
 
 
 async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -65,9 +73,11 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("awaiting_mode", None)
     context.user_data.pop("session_preview", None)
     context.user_data.pop("setting_edit", None)
+    context.user_data.pop("customer_flow", None)
     keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📅 Create / open week", callback_data="admin:create_week")],
+            [InlineKeyboardButton("👥 Users", callback_data="admin:users")],
             [InlineKeyboardButton("⚙️ Settings", callback_data="admin:settings")],
         ]
     )
@@ -273,6 +283,17 @@ async def admin_buttons(
     action = query.data or ""
     today = datetime.now(GYM_TIMEZONE).date()
 
+    if action.startswith("admin:users"):
+        if query.message is None or query.message.chat.type != "private":
+            await query.edit_message_text("Open /admin in a private chat to manage customers.")
+            return
+        for key in ("awaiting_times", "awaiting_mode", "session_preview", "setting_edit"):
+            context.user_data.pop(key, None)
+        await handle_users_button(update, context)
+        return
+
+    context.user_data.pop("customer_flow", None)
+
     if action == "admin:home":
         context.user_data.pop("awaiting_times", None)
         context.user_data.pop("awaiting_mode", None)
@@ -282,7 +303,8 @@ async def admin_buttons(
             "Gym admin panel",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📅 Create / open week", callback_data="admin:create_week")],
-                [InlineKeyboardButton("⚙️ Settings", callback_data="admin:settings")],
+                [InlineKeyboardButton("👥 Users", callback_data="admin:users")],
+            [InlineKeyboardButton("⚙️ Settings", callback_data="admin:settings")],
             ]),
         )
         return
@@ -627,6 +649,10 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if update.message is None or update.message.text is None:
         return
 
+    if context.user_data.get("customer_flow") is not None:
+        await handle_customer_text(update, context)
+        return
+
     pending = context.user_data.get("setting_edit")
     if pending is not None:
         if pending.get("stage") != "input":
@@ -733,6 +759,9 @@ def main() -> None:
         CallbackQueryHandler(admin_buttons, pattern=r"^admin:")
     )
 
+    application.add_handler(
+        MessageHandler(filters.CONTACT & filters.ChatType.PRIVATE, contact_registration)
+    )
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, admin_text)
     )
